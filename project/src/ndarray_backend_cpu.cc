@@ -244,6 +244,48 @@ void EwiseTanh(const AlignedArray& a, AlignedArray* out) {
   unary_op(a, out, [](scalar_t x) { return std::tanh(x); });
 }
 
+inline scalar_t apply_fused_op(scalar_t x, int32_t op, scalar_t param) {
+  switch (op) {
+    case 1:
+      return x + param;
+    case 2:
+      return x * param;
+    case 3:
+      return x / param;
+    case 4:
+      return std::pow(x, param);
+    case 5:
+      return -x;
+    case 6:
+      return std::exp(x);
+    case 7:
+      return std::log(x);
+    case 8:
+      return std::tanh(x);
+    case 9:
+      return x > 0 ? x : 0;
+    default:
+      return x;
+  }
+}
+
+void FusedElementwise(const AlignedArray& base,
+                      const std::vector<AlignedArray*>& outs,
+                      const std::vector<int32_t>& op_codes,
+                      const std::vector<float>& op_params) {
+  size_t n_ops = op_codes.size();
+  if (n_ops == 0) return;
+  if (outs.size() != n_ops || op_params.size() != n_ops)
+    throw std::runtime_error("EW-Fuse metadata mismatch.");
+  for (size_t idx = 0; idx < base.size; ++idx) {
+    scalar_t val = base.ptr[idx];
+    for (size_t op_idx = 0; op_idx < n_ops; ++op_idx) {
+      val = apply_fused_op(val, op_codes[op_idx], op_params[op_idx]);
+      outs[op_idx]->ptr[idx] = val;
+    }
+  }
+}
+
 
 void Matmul(const AlignedArray& a, const AlignedArray& b, AlignedArray* out, uint32_t m, uint32_t n,
             uint32_t p) {
@@ -473,4 +515,5 @@ PYBIND11_MODULE(ndarray_backend_cpu, m) {
 
   m.def("reduce_max", ReduceMax);
   m.def("reduce_sum", ReduceSum);
+  m.def("fused_elementwise", FusedElementwise);
 }

@@ -115,3 +115,35 @@ def reduce_max(a, out, reduce_size):
 
 def reduce_sum(a, out, reduce_size):
     out.array[:] = a.array[:].reshape(-1, reduce_size).sum(axis=1)
+
+
+def _apply_op(arr, code, param):
+    if code == 1:
+        return arr + param
+    if code == 2:
+        return arr * param
+    if code == 3:
+        return arr / param
+    if code == 4:
+        return arr**param
+    if code == 5:
+        return -arr
+    if code == 6:
+        return np.exp(arr)
+    if code == 7:
+        return np.log(arr)
+    if code == 8:
+        return np.tanh(arr)
+    if code == 9:
+        return np.maximum(arr, 0.0)
+    return arr
+
+
+def fused_elementwise(base, outs, op_codes, op_params):
+    if not op_codes:
+        return
+    data = base.array
+    current = data
+    for idx, code in enumerate(op_codes):
+        current = _apply_op(current, code, op_params[idx])
+        outs[idx].array[:] = current

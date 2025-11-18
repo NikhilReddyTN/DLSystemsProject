@@ -5,6 +5,7 @@
 
 #include <iostream>
 #include <sstream>
+#include <vector>
 
 namespace needle {
 namespace cuda {
@@ -306,6 +307,50 @@ __global__ void EwiseTanhKernel(const scalar_t* a, scalar_t* out, size_t size) {
   if (gid < size) out[gid] = tanhf(a[gid]);
 }
 
+struct FusedOp {
+  int32_t code;
+  scalar_t param;
+};
+
+__device__ inline scalar_t ApplyFusedOp(scalar_t x, const FusedOp& op) {
+  switch (op.code) {
+    case 1:
+      return x + op.param;
+    case 2:
+      return x * op.param;
+    case 3:
+      return x / op.param;
+    case 4:
+      return powf(x, op.param);
+    case 5:
+      return -x;
+    case 6:
+      return expf(x);
+    case 7:
+      return logf(x);
+    case 8:
+      return tanhf(x);
+    case 9:
+      return x > 0 ? x : 0;
+    default:
+      return x;
+  }
+}
+
+__global__ void FusedElementwiseKernel(const scalar_t* base,
+                                       scalar_t** outs,
+                                       FusedOp* ops,
+                                       size_t n_ops,
+                                       size_t size) {
+  size_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+  if (gid >= size) return;
+  scalar_t val = base[gid];
+  for (size_t i = 0; i < n_ops; ++i) {
+    val = ApplyFusedOp(val, ops[i]);
+    outs[i][gid] = val;
+  }
+}
+
 __global__ void ScalarMulKernel(const scalar_t* a, scalar_t val, scalar_t* out, size_t size) {
   size_t gid = blockIdx.x * blockDim.x + threadIdx.x;
   if (gid < size) out[gid] = a[gid] * val;
@@ -404,6 +449,50 @@ void EwiseExp(const CudaArray& a, CudaArray* out) {
 void EwiseTanh(const CudaArray& a, CudaArray* out) {
   CudaDims dim = CudaOneDim(out->size);
   EwiseTanhKernel<<<dim.grid, dim.block>>>(a.ptr, out->ptr, out->size);
+}
+
+void FusedElementwise(const CudaArray& base,
+                      const std::vector<CudaArray*>& outs,
+                      const std::vector<int32_t>& op_codes,
+                      const std::vector<float>& op_params) {
+  size_t n_ops = op_codes.size();
+  if (n_ops == 0) return;
+  if (outs.size() != n_ops || op_params.size() != n_ops)
+    throw std::runtime_error("EW-Fuse metadata mismatch.");
+  std::vector<scalar_t*> host_outs(n_ops);
+  for (size_t i = 0; i < n_ops; ++i) host_outs[i] = outs[i]->ptr;
+  scalar_t** device_outs = nullptr;
+  cudaError_t err = cudaMalloc(&device_outs, n_ops * sizeof(scalar_t*));
+  if (err != cudaSuccess) throw std::runtime_error(cudaGetErrorString(err));
+  err = cudaMemcpy(device_outs, host_outs.data(), n_ops * sizeof(scalar_t*),
+                   cudaMemcpyHostToDevice);
+  if (err != cudaSuccess) {
+    cudaFree(device_outs);
+    throw std::runtime_error(cudaGetErrorString(err));
+  }
+  std::vector<FusedOp> host_ops(n_ops);
+  for (size_t i = 0; i < n_ops; ++i) {
+    host_ops[i].code = op_codes[i];
+    host_ops[i].param = op_params[i];
+  }
+  FusedOp* device_ops = nullptr;
+  err = cudaMalloc(&device_ops, n_ops * sizeof(FusedOp));
+  if (err != cudaSuccess) {
+    cudaFree(device_outs);
+    throw std::runtime_error(cudaGetErrorString(err));
+  }
+  err = cudaMemcpy(device_ops, host_ops.data(), n_ops * sizeof(FusedOp),
+                   cudaMemcpyHostToDevice);
+  if (err != cudaSuccess) {
+    cudaFree(device_outs);
+    cudaFree(device_ops);
+    throw std::runtime_error(cudaGetErrorString(err));
+  }
+  CudaDims dim = CudaOneDim(base.size);
+  FusedElementwiseKernel<<<dim.grid, dim.block>>>(base.ptr, device_outs, device_ops,
+                                                  n_ops, base.size);
+  cudaFree(device_outs);
+  cudaFree(device_ops);
 }
 
 
@@ -582,6 +671,7 @@ PYBIND11_MODULE(ndarray_backend_cuda, m) {
   m.def("ewise_log", EwiseLog);
   m.def("ewise_exp", EwiseExp);
   m.def("ewise_tanh", EwiseTanh);
+  m.def("fused_elementwise", FusedElementwise);
 
   m.def("matmul", Matmul);
 

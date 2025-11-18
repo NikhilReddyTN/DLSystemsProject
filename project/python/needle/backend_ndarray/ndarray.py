@@ -1,12 +1,42 @@
 import math
 import operator
 from functools import reduce
-from typing import Any, Callable, Iterable, Union
+from typing import Any, Callable, Iterable, Union, Sequence
 
 import numpy as np
 
 from . import ndarray_backend_numpy
 from . import ndarray_backend_cpu  # type: ignore[attr-defined]
+from ..profiler import KERNEL_PROFILER
+
+KERNEL_LAUNCH_OPS = frozenset(
+    {
+        "fill",
+        "compact",
+        "ewise_setitem",
+        "scalar_setitem",
+        "ewise_add",
+        "scalar_add",
+        "ewise_mul",
+        "scalar_mul",
+        "ewise_div",
+        "scalar_div",
+        "scalar_power",
+        "ewise_maximum",
+        "scalar_maximum",
+        "ewise_eq",
+        "scalar_eq",
+        "ewise_ge",
+        "scalar_ge",
+        "ewise_log",
+        "ewise_exp",
+        "ewise_tanh",
+        "matmul",
+        "reduce_max",
+        "reduce_sum",
+        "fused_elementwise",
+    }
+)
 
 
 # math.prod not in Python 3.7
@@ -28,7 +58,17 @@ class BackendDevice:
         return self.name + "()"
 
     def __getattr__(self, name: str) -> Any:
-        return getattr(self.mod, name)
+        attr = getattr(self.mod, name)
+        if callable(attr) and name in KERNEL_LAUNCH_OPS:
+            device_name = self.name
+
+            def wrapped(*args, **kwargs):
+                KERNEL_PROFILER.record(device_name, name)
+                return attr(*args, **kwargs)
+
+            setattr(self, name, wrapped)
+            return wrapped
+        return attr
 
     def enabled(self) -> bool:
         return self.mod is not None
@@ -638,7 +678,7 @@ class NDArray:
         return view.compact()
         ### END YOUR SOLUTION
 
-    def pad(self, axes: tuple[tuple[int, int], ...]) -> "NDArray":
+def pad(self, axes: tuple[tuple[int, int], ...]) -> "NDArray":
         """
         Pad this ndarray by zeros by the specified amount in `axes`,
         which lists for _all_ axes the left and right padding amount, e.g.,
@@ -659,6 +699,28 @@ class NDArray:
         out[insert_slices] = self
         return out
         ### END YOUR SOLUTION
+
+
+def fused_elementwise(
+    base: NDArray,
+    out_arrays: list[NDArray],
+    op_codes: Sequence[int],
+    op_params: Sequence[float],
+) -> None:
+    if not out_arrays:
+        return
+    assert len(out_arrays) == len(op_codes) == len(op_params)
+    src = base if base.is_compact() else base.compact()
+    device = src.device
+    for arr in out_arrays:
+        if arr.device != device:
+            raise ValueError("Fused outputs must match input device.")
+    handles = []
+    for arr in out_arrays:
+        if not arr.is_compact():
+            raise ValueError("Fused outputs must be compact.")
+        handles.append(arr._handle)
+    device.fused_elementwise(src._handle, handles, list(op_codes), list(op_params))
 
 def array(a: Any, dtype: str = "float32", device: BackendDevice | None = None) -> NDArray:
     """Convenience methods to match numpy a bit more closely."""

@@ -1,4 +1,5 @@
 """Core data structures."""
+import os
 import needle
 from .backend_numpy import Device, all_devices
 from typing import List, Optional, NamedTuple, Tuple, Union, Dict
@@ -10,6 +11,7 @@ from needle import init
 # needle version
 LAZY_MODE = False
 TENSOR_COUNTER = 0
+ENABLE_EW_FUSION = os.environ.get("NEEDLE_EW_FUSION", "1") != "0"
 
 # NOTE: we will import numpy as the array_api
 # as the backend for our computations, this line will change in later homeworks
@@ -18,6 +20,21 @@ import numpy as array_api
 NDArray = numpy.ndarray
 
 from .backend_selection import array_api, NDArray, default_device, cpu
+
+EW_FUSION_ACTIVE = ENABLE_EW_FUSION and hasattr(array_api, "fused_elementwise")
+
+# Keep op codes in sync with backend implementations.
+FUSED_OP_ADD_SCALAR = 1
+FUSED_OP_MUL_SCALAR = 2
+FUSED_OP_DIV_SCALAR = 3
+FUSED_OP_POWER_SCALAR = 4
+FUSED_OP_NEGATE = 5
+FUSED_OP_EXP = 6
+FUSED_OP_LOG = 7
+FUSED_OP_TANH = 8
+FUSED_OP_RELU = 9
+
+_FUSION_REGISTRY = None
 
 class Op:
     """Operator definition."""
@@ -134,6 +151,10 @@ class Value:
         self.num_outputs = num_outputs
         self.cached_data = cached_data
         self.requires_grad = requires_grad
+        self._num_users = 0
+        for inp in inputs:
+            if hasattr(inp, "_num_users"):
+                inp._num_users += 1
 
     @classmethod
     def make_const(cls, data, *, requires_grad=False):
@@ -236,10 +257,14 @@ class Tensor(Value):
     def make_from_op(op: Op, inputs: List["Value"]):
         tensor = Tensor.__new__(Tensor)
         tensor._init(op, inputs)
+        skip_realize = (
+            EW_FUSION_ACTIVE and tensor.requires_grad and _is_fusible_op(op)
+        )
         if not LAZY_MODE:
             if not tensor.requires_grad:
                 return tensor.detach()
-            tensor.realize_cached_data()
+            if not skip_realize:
+                tensor.realize_cached_data()
         return tensor
 
     @staticmethod
@@ -307,6 +332,13 @@ class Tensor(Value):
         if array_api is numpy:
             return numpy.array(data)
         return data.numpy()
+
+    def realize_cached_data(self):
+        if self.cached_data is not None:
+            return self.cached_data
+        if EW_FUSION_ACTIVE and _attempt_elementwise_fusion(self):
+            return self.cached_data
+        return super().realize_cached_data()
 
     def __add__(self, other):
         if isinstance(other, Tensor):
@@ -396,6 +428,106 @@ def compute_gradient_of_variables(output_tensor, out_grad):
               node_to_output_grads_list[in_node] = []
             node_to_output_grads_list[in_node].append(input_grads[k])
     ### END YOUR SOLUTION
+
+
+def _get_fusion_registry():
+    global _FUSION_REGISTRY
+    if _FUSION_REGISTRY is None:
+        import needle.ops as ops
+
+        _FUSION_REGISTRY = {
+            ops.AddScalar: (FUSED_OP_ADD_SCALAR, lambda op: float(op.scalar)),
+            ops.MulScalar: (FUSED_OP_MUL_SCALAR, lambda op: float(op.scalar)),
+            ops.DivScalar: (FUSED_OP_DIV_SCALAR, lambda op: float(op.scalar)),
+            ops.PowerScalar: (FUSED_OP_POWER_SCALAR, lambda op: float(op.scalar)),
+            ops.Negate: (FUSED_OP_NEGATE, lambda op: 0.0),
+            ops.Exp: (FUSED_OP_EXP, lambda op: 0.0),
+            ops.Log: (FUSED_OP_LOG, lambda op: 0.0),
+            ops.Tanh: (FUSED_OP_TANH, lambda op: 0.0),
+            ops.ReLU: (FUSED_OP_RELU, lambda op: 0.0),
+        }
+    return _FUSION_REGISTRY
+
+
+def _is_fusible_op(op: Optional[Op]) -> bool:
+    if op is None:
+        return False
+    registry = _get_fusion_registry()
+    return op.__class__ in registry
+
+
+def _fusion_metadata(op: Op) -> Tuple[int, float]:
+    code, extractor = _get_fusion_registry()[op.__class__]
+    return code, extractor(op)
+
+
+def _attempt_elementwise_fusion(node: "Tensor") -> bool:
+    chain_info = _collect_fusible_chain(node)
+    if chain_info is None:
+        return False
+    base, chain = chain_info
+    base_data = base.realize_cached_data()
+    if base_data is None:
+        return False
+    if not hasattr(base_data, "is_compact"):
+        return False
+    base_array = base_data if base_data.is_compact() else base_data.compact()
+    device = base_array.device
+    outputs = []
+    codes: List[int] = []
+    params: List[float] = []
+    for current in chain:
+        out_arr = array_api.empty(base_array.shape, device=device)
+        current.cached_data = out_arr
+        code, param = _fusion_metadata(current.op)
+        outputs.append(out_arr)
+        codes.append(code)
+        params.append(param)
+    array_api.fused_elementwise(base_array, outputs, codes, params)
+    return True
+
+
+def _collect_fusible_chain(node: "Tensor") -> Optional[Tuple["Tensor", List["Tensor"]]]:
+    if not _is_fusible_node(node):
+        return None
+    chain: List[Tensor] = []
+    current: Tensor = node
+    base: Optional[Tensor] = None
+    while True:
+        chain.append(current)
+        parent = current.inputs[0]
+        if not isinstance(parent, Tensor):
+            base = None
+            break
+        if not _can_fuse_parent(parent):
+            base = parent
+            break
+        current = parent
+    if base is None or not isinstance(base, Tensor) or len(chain) < 2:
+        return None
+    chain.reverse()
+    return base, chain
+
+
+def _is_fusible_node(node: "Tensor") -> bool:
+    return (
+        isinstance(node, Tensor)
+        and node.cached_data is None
+        and node.op is not None
+        and len(node.inputs) == 1
+        and _is_fusible_op(node.op)
+    )
+
+
+def _can_fuse_parent(parent: "Tensor") -> bool:
+    return (
+        isinstance(parent, Tensor)
+        and parent.cached_data is None
+        and parent.op is not None
+        and getattr(parent, "_num_users", 0) == 1
+        and len(parent.inputs) == 1
+        and _is_fusible_op(parent.op)
+    )
 
 
 def find_topo_sort(node_list: List[Value]) -> List[Value]:
