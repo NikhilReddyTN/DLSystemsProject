@@ -1,3 +1,0 @@
-/Users/nikhilreddy/Course Work/Sem-3/DL_Systems/DLSystemsProject/project/build/CMakeFiles/ndarray_backend_cpu.dir
-/Users/nikhilreddy/Course Work/Sem-3/DL_Systems/DLSystemsProject/project/build/CMakeFiles/edit_cache.dir
-/Users/nikhilreddy/Course Work/Sem-3/DL_Systems/DLSystemsProject/project/build/CMakeFiles/rebuild_cache.dir
