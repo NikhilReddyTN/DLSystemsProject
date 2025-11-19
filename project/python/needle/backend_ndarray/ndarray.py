@@ -678,7 +678,7 @@ class NDArray:
         return view.compact()
         ### END YOUR SOLUTION
 
-def pad(self, axes: tuple[tuple[int, int], ...]) -> "NDArray":
+    def pad(self, axes: tuple[tuple[int, int], ...]) -> "NDArray":
         """
         Pad this ndarray by zeros by the specified amount in `axes`,
         which lists for _all_ axes the left and right padding amount, e.g.,

@@ -2,12 +2,14 @@ import argparse
 import sys
 from typing import Iterable, Tuple
 
+
 import numpy as np
 
 sys.path.append("python")
 
 import needle as ndl
 import needle.nn as nn
+from needle import ops
 
 
 def _get_device(name: str):
@@ -45,6 +47,23 @@ def _run_epoch(model, optimizer, loss_fn, data, labels, batch_size, device, prep
         optimizer.step()
 
 
+class UnaryChain(nn.Module):
+    """Stack of unary elementwise ops designed to benefit from EW fusion."""
+
+    def __init__(self, shift: float = 1.0, scale: float = 0.5):
+        super().__init__()
+        self.shift = shift
+        self.scale = scale
+
+    def forward(self, x):
+        y = x + self.shift
+        y = y * self.scale
+        y = ops.exp(y)
+        y = ops.tanh(y)
+        y = ops.relu(y)
+        return y
+
+
 def profile_mlp(args, device):
     np.random.seed(0)
     samples = 2048
@@ -54,9 +73,9 @@ def profile_mlp(args, device):
     labels = np.random.randint(0, num_classes, size=(samples,)).astype("float32")
     model = nn.Sequential(
         nn.Linear(in_dim, 256, device=device),
-        nn.ReLU(),
+        UnaryChain(shift=1.25, scale=0.75),
         nn.Linear(256, 128, device=device),
-        nn.ReLU(),
+        UnaryChain(shift=-0.5, scale=1.1),
         nn.Linear(128, num_classes, device=device),
     )
     opt = ndl.optim.Adam(model.parameters(), lr=1e-3)
@@ -76,12 +95,12 @@ def profile_cnn(args, device):
     labels = np.random.randint(0, num_classes, size=(samples,)).astype("float32")
     model = nn.Sequential(
         nn.Conv(3, 16, 3, device=device),
-        nn.ReLU(),
+        UnaryChain(shift=0.25, scale=0.9),
         nn.Conv(16, 32, 3, device=device),
-        nn.ReLU(),
+        UnaryChain(shift=-0.35, scale=1.2),
         nn.Flatten(),
         nn.Linear(32 * 32 * 32, 128, device=device),
-        nn.ReLU(),
+        UnaryChain(shift=0.1, scale=0.95),
         nn.Linear(128, num_classes, device=device),
     )
     opt = ndl.optim.Adam(model.parameters(), lr=5e-4)
@@ -110,11 +129,14 @@ def profile_rnn(args, device):
         def __init__(self, device):
             super().__init__()
             self.rnn = nn.RNN(input_dim, 64, num_layers=1, device=device)
+            self.post = UnaryChain(shift=0.4, scale=0.8)
             self.classifier = nn.Linear(64, num_classes, device=device)
 
         def forward(self, x):
             out, _ = self.rnn(x)
-            last = out[-1]
+            steps = ops.split(out, axis=0)
+            last = steps[len(steps) - 1]
+            last = self.post(last)
             return self.classifier(last)
 
     def preprocess(batch):
